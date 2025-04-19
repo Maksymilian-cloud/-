@@ -3,10 +3,10 @@ import json
 import re
 import logging
 import requests
-from flask import Flask, render_template, request, redirect, url_for, session, send_from_directory, flash, jsonify, Response, stream_with_context, current_app, url_for, send_file
+from flask import Flask, render_template, request, redirect, url_for, session, send_from_directory, flash, jsonify, Response, stream_with_context, current_app, url_for
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
-import yt_dlp
+from pytubefix import YouTube
 import subprocess
 from datetime import datetime, timedelta
 import hashlib
@@ -26,8 +26,8 @@ app.config['STRIPE_SECRET_KEY'] = 'sk_live_51RFAaECAmGynqUgHJqy5VP0WX9nLTPPg6AGn
 # Initialize Stripe
 stripe.api_key = app.config['STRIPE_SECRET_KEY']
 
-upload_queue = queue.Queue()
 upload_progress = {}
+upload_queue = queue.Queue()
 progress_updates = []
 
 # Directory setup
@@ -283,53 +283,89 @@ def save_video_info(video_id, info):
 def root():
     return redirect(url_for('home'))
 
-def download_yt_with_fallback_resolution(url, output_path, filename):
+def download_yt_with_fallback_resolution(yt, output_path, filename):
     """
     Attempts to download a YouTube video in the best resolution available,
     prioritizing 1080p. Will not download 4K or 8K.
     
     Args:
-        url: URL of the YouTube video
+        yt: YouTube object
         output_path: Directory to save the video
         filename: Filename for the downloaded video
     
     Returns:
         The path to the downloaded file, or None if download failed
     """
-    # Retrieve the visitor data and po-token from environment variables
-    po_token = os.getenv("PO_TOKEN")
-    visitor_data = os.getenv("VISITOR_DATA")
-    
-    if not po_token or not visitor_data:
-        print("Error: Missing PO_TOKEN or VISITOR_DATA environment variables.")
-        return None
-
     # Define the resolution preferences in order (highest to lowest)
     preferred_resolutions = ['1080p', '720p', '480p', '360p', '240p', '144p']
     
-    # yt-dlp options for downloading
-    ydl_opts = {
-        'format': 'bestvideo[height<=1080]+bestaudio/best',  # Prioritize best video up to 1080p
-        'outtmpl': os.path.join(output_path, filename),  # Output path and filename
-        'noplaylist': True,  # Don't download playlist, only the single video
-        'quiet': False,  # Show download progress
-        'cookiefile': 'cookies.txt',  # Optionally use cookies file if needed
-        'headers': {
-            'Authorization': f'Bearer {po_token}',
-        },
-        'cookies': {
-            'VISITOR_DATA': visitor_data
-        }
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Extract info from the URL and download
-            info_dict = ydl.extract_info(url, download=True)
-            print(f"Downloaded: {info_dict['title']}")
+    # First try to get 1080p specifically
+    stream = yt.streams.filter(
+        progressive=True,  # Progressive includes audio and video in one file
+        file_extension='mp4',
+        resolution='1080p'
+    ).first()
+    
+    if stream:
+        logger.info("Downloading video in 1080p")
+        stream.download(output_path=output_path, filename=filename)
+        return os.path.join(output_path, filename)
+    
+    # If 1080p not available, try other resolutions in order
+    for resolution in preferred_resolutions[1:]:  # Skip 1080p as we already tried it
+        stream = yt.streams.filter(
+            progressive=True,
+            file_extension='mp4',
+            resolution=resolution
+        ).first()
+        
+        if stream:
+            logger.info(f"1080p not available. Downloading in {resolution}")
+            stream.download(output_path=output_path, filename=filename)
             return os.path.join(output_path, filename)
-    except Exception as e:
-        print(f"Error during download: {e}")
+    
+    # If none of the specific resolutions worked, get the highest available
+    # that is not higher than 1080p
+    all_streams = yt.streams.filter(
+        progressive=True,
+        file_extension='mp4'
+    ).all()
+    
+    # Sort streams by resolution (highest first)
+    available_streams = []
+    for s in all_streams:
+        try:
+            # Extract the numeric part of the resolution (e.g., '1080p' -> 1080)
+            res_value = int(s.resolution[:-1]) if s.resolution else 0
+            # Only consider resolutions up to 1080p
+            if res_value <= 1080:
+                available_streams.append((res_value, s))
+        except (ValueError, TypeError, AttributeError):
+            pass
+    
+    # Sort by resolution, highest first
+    available_streams.sort(reverse=True)
+    
+    if available_streams:
+        # Get the highest resolution stream that's not higher than 1080p
+        best_stream = available_streams[0][1]
+        logger.info(f"Downloading highest available resolution: {best_stream.resolution}")
+        best_stream.download(output_path=output_path, filename=filename)
+        return os.path.join(output_path, filename)
+    
+    # Last resort: try any progressive stream
+    logger.warning("Could not find suitable resolution, trying any available stream")
+    stream = yt.streams.filter(
+        progressive=True,
+        file_extension='mp4'
+    ).first()
+    
+    if stream:
+        logger.info(f"Downloading video in {stream.resolution}")
+        stream.download(output_path=output_path, filename=filename)
+        return os.path.join(output_path, filename)
+    else:
+        logger.error("No suitable stream found for download")
         return None
 
 @app.route('/multiple-youtube-upload')
@@ -368,10 +404,10 @@ def upload_multiple_youtube():
         }
         upload_queue.put((i, url))
 
-    # Start worker threads with username and other required arguments passed in
+    # Start worker threads with username passed in
     max_workers = min(3, len(youtube_urls))
     for _ in range(max_workers):
-        t = threading.Thread(target=download_worker, args=(upload_progress, uploads_folder, thumbnails_folder, user_data_folder, username))
+        t = threading.Thread(target=download_worker, args=(username,))
         t.daemon = True
         t.start()
 
@@ -380,7 +416,6 @@ def upload_multiple_youtube():
         "message": f"Processing {len(youtube_urls)} videos",
         "redirect": url_for('home')
     })
-
 
 def update_premium_status(username, is_premium=True):
     """Update a user's premium status"""
@@ -414,13 +449,7 @@ def premium_panel():
     # If user is premium, render the premium panel
     return render_template('premium_panel.html')
 
-import yt_dlp as ytdlp
-import os
-import json
-import requests
-from datetime import datetime
-
-def download_worker(upload_progress, uploads_folder, thumbnails_folder, user_data_folder, username):
+def download_worker(username):
     while not upload_queue.empty():
         try:
             index, url = upload_queue.get()
@@ -435,43 +464,33 @@ def download_worker(upload_progress, uploads_folder, thumbnails_folder, user_dat
             })
 
             try:
-                # Retrieve the visitor data and po-token from environment variables
-                po_token = os.getenv("PO_TOKEN")
-                visitor_data = os.getenv("VISITOR_DATA")
-                
-                if not po_token or not visitor_data:
-                    raise ValueError("Missing PO_TOKEN or VISITOR_DATA environment variables.")
-                
-                # Set up the yt-dlp options for downloading the video
-                ydl_opts = {
-                    'format': 'best',  # You can adjust the format option to 'bestvideo+bestaudio'
-                    'progress_hooks': [lambda d: update_progress(index, d)],
-                    'outtmpl': os.path.join(uploads_folder, f'%(id)s.%(ext)s'),  # Save in the uploads folder
-                    'noplaylist': True,  # Don't download playlist, just single video
-                    'quiet': False,
-                    'writeinfojson': True  # Write metadata to JSON for video details
-                }
+                # Process YouTube URL
+                yt = YouTube(url, on_progress_callback=lambda stream, chunk, bytes_remaining: update_progress(
+                    index, stream, chunk, bytes_remaining
+                ))
 
-                # Download the video using yt-dlp
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info_dict = ydl.extract_info(url, download=True)  # Extract video info and download
-
-                # Video and thumbnail filenames
-                video_id = sanitize_video_id(info_dict['id'])
-                video_filename = f"{video_id}.mp4"
-                thumbnail_filename = f"{video_id}.jpg"
-
-                # Update the progress with video title
-                upload_progress[index]["title"] = info_dict.get("title", "Untitled Video").replace('#', '')
+                # Update with video title
+                upload_progress[index]["title"] = yt.title.replace('#', '')
                 progress_updates.append({
                     "type": "progress",
                     "index": index,
-                    "progress": 0,  # Update this with actual progress if required
+                    "progress": 0,
                     "title": upload_progress[index]["title"]
                 })
 
-                # Download the thumbnail image
-                thumb_url = info_dict.get('thumbnail', '')
+                # Get video ID and prepare filenames
+                video_id = sanitize_video_id(yt.video_id)
+                video_filename = f"{video_id}.mp4"
+                thumbnail_filename = f"{video_id}.jpg"
+
+                # Download video
+                video_path = download_yt_with_fallback_resolution(yt, uploads_folder, video_filename)
+
+                if not video_path:
+                    raise Exception("Failed to download video at any resolution")
+
+                # Download thumbnail
+                thumb_url = yt.thumbnail_url
                 try:
                     thumb_resp = requests.get(thumb_url)
                     thumb_resp.raise_for_status()
@@ -485,8 +504,8 @@ def download_worker(upload_progress, uploads_folder, thumbnails_folder, user_dat
                             with open(default_thumb, 'rb') as df:
                                 f.write(df.read())
 
-                # Get video duration from the info dict
-                duration = info_dict.get('duration', 0)
+                # Get video duration
+                duration = get_video_duration(video_path)
 
                 # Count subscribers
                 subscribers_count = 0
@@ -503,15 +522,15 @@ def download_worker(upload_progress, uploads_folder, thumbnails_folder, user_dat
                 # Save metadata
                 video_info = {
                     'title': upload_progress[index]["title"],
-                    'description': info_dict.get('description', 'No description available.'),
-                    'views': str(info_dict.get('view_count', 0)),
-                    'likes': str(info_dict.get('like_count', 0)),
-                    'dislikes': str(info_dict.get('dislike_count', 0)),
+                    'description': yt.description or "No description available.",
+                    'views': "0",
+                    'likes': "0",
+                    'dislikes': "0",
                     'date': datetime.now().strftime("%b %d, %Y"),
                     'age': "Just now",
                     'channel': username,
                     'subscribers': str(subscribers_count),
-                    'comments_count': str(info_dict.get('comment_count', 0)),
+                    'comments_count': "0",
                     'duration': duration,
                     'uploaded_by': username,
                     'views_by': {},
@@ -973,10 +992,6 @@ def dashboard():
             
     return render_template('dashboard.html', videos=user_videos, username=username)
 
-@app.route("/logo")
-def serve_logo():
-    return send_from_directory("static", "logo.png")
-
 @app.route('/download/<video_id>')
 def download_video(video_id):
     """Allow users to download the video"""
@@ -1219,47 +1234,19 @@ def watch_page(video_id):
 
 @app.route('/video/<video_id>')
 def watch_video(video_id):
+    """Stream the video file"""
     video_path = os.path.join(uploads_folder, f"{video_id}.mp4")
     if not os.path.exists(video_path):
         return "Video not found", 404
-
-    file_size = os.path.getsize(video_path)
-    range_header = request.headers.get('Range', None)
-
-    if range_header:
-        # Parse the range header (example: "bytes=1000-")
-        byte1, byte2 = 0, None
-        match = range_header.replace('bytes=', '').split('-')
-        if match[0]:
-            byte1 = int(match[0])
-        if len(match) > 1 and match[1]:
-            byte2 = int(match[1])
-
-        length = (byte2 or file_size - 1) - byte1 + 1
-        with open(video_path, 'rb') as f:
-            f.seek(byte1)
-            data = f.read(length)
-
-        rv = Response(data, 
-                      status=206, 
-                      mimetype='video/mp4',
-                      headers={
-                          'Content-Range': f'bytes {byte1}-{byte1 + length - 1}/{file_size}',
-                          'Accept-Ranges': 'bytes',
-                          'Content-Length': str(length)
-                      })
-        return rv
-
-    # If no Range header, just serve the whole file
-    with open(video_path, 'rb') as f:
-        data = f.read()
-
-    return Response(data, 
-                    mimetype='video/mp4', 
-                    headers={
-                        'Content-Length': str(file_size),
-                        'Accept-Ranges': 'bytes'
-                    })
+        
+    def generate():
+        with open(video_path, 'rb') as video_file:
+            data = video_file.read(1024 * 1024)  # Read 1MB at a time
+            while data:
+                yield data
+                data = video_file.read(1024 * 1024)
+                
+    return Response(generate(), mimetype='video/mp4')
 
 @app.route('/search')
 def search():
